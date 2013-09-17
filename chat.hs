@@ -33,32 +33,39 @@ port = 44444
 type ClientName = String
 
 data Client = Client
-  { clientName     :: ClientName
-  , clientHandle   :: Handle
-  , clientKicked   :: TVar (Maybe String)
-  , clientSendChan :: TChan Message
+  { clientName          :: ClientName
+  , clientHandle        :: Handle
+  , clientKicked        :: TVar (Maybe String)
+  , clientSendChan      :: TChan Message
+  , clientBroadcastChan :: TChan Message
   }
 
-newClient :: ClientName -> Handle -> STM Client
-newClient name handle = do
+newClient :: Server -> ClientName -> Handle -> STM Client
+newClient Server{..} name handle = do
   c <- newTChan
+  b <- dupTChan serverBroadcastChan
   k <- newTVar Nothing
-  return Client { clientName     = name
-                , clientHandle   = handle
-                , clientKicked   = k
-                , clientSendChan = c
+  return Client { clientName          = name
+                , clientHandle        = handle
+                , clientKicked        = k
+                , clientSendChan      = c
+                , clientBroadcastChan = b
                 }
 -- >>
 
 -- <<Server
 data Server = Server
-  { clients :: TVar (Map ClientName Client)
+  { clients             :: TVar (Map ClientName Client)
+  , serverBroadcastChan :: TChan Message
   }
 
 newServer :: IO Server
 newServer = do
   c <- newTVarIO Map.empty
-  return Server { clients = c }
+  b <- newTChanIO
+  return Server { clients             = c
+                , serverBroadcastChan = b
+                }
 -- >>
 
 -- <<Message
@@ -70,11 +77,6 @@ data Message = Notice String
 
 -------------------------------------------------------------------------------
 -- Basic ops
-
-broadcast :: Server -> Message -> STM ()
-broadcast Server{..} msg = do
-  clientmap <- readTVar clients
-  mapM_ (\client -> sendMessage client msg) (Map.elems clientmap)
 
 tell :: Server -> Client -> ClientName -> String -> IO ()
 tell server@Server{..} Client{..} who msg = do
@@ -92,6 +94,10 @@ kick server@Server{..} who by = do
        Just victim -> do
          writeTVar (clientKicked victim) $ Just ("by " ++ by)
          void $ sendToName server by (Notice $ "you kicked " ++ who)
+
+broadcast :: Server -> Message -> STM ()
+broadcast Server{..} msg =
+  writeTChan serverBroadcastChan msg
 
 sendMessage :: Client -> Message -> STM ()
 sendMessage Client{..} msg =
@@ -114,7 +120,7 @@ checkAddClient server@Server{..} name handle = atomically $ do
   if Map.member name clientmap
      then return Nothing
      else do
-       client <- newClient name handle
+       client <- newClient server name handle
        writeTVar clients $ Map.insert name client clientmap
        broadcast server $ Notice (name ++ " has connected")
        return (Just client)
@@ -139,7 +145,7 @@ runClient serv@Server{..} client@Client{..} = do
            Just reason -> return $
              hPutStrLn clientHandle $ "You have been kicked: " ++ reason
            Nothing -> do
-             msg <- readTChan clientSendChan
+             msg <- readTChan clientSendChan `orElse` readTChan clientBroadcastChan
              return $ do
                continue <- handleMessage serv client msg
                when continue $ server
